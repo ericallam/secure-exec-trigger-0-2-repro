@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npx trigger dev"
+    "dev": "npx trigger dev",
+    "standalone": "node standalone/build-and-run.mjs"
   },
   "dependencies": {
     "@trigger.dev/sdk": "4.4.3",
+    "esbuild": "^0.25.0",
     "secure-exec": "0.2.0-rc.2"
   },
   "devDependencies": {

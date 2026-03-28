@@ -1,59 +1,71 @@
-# secure-exec 0.2.0-rc.2 + Trigger.dev reproduction
+# secure-exec 0.2.0-rc.2 + esbuild bundling reproduction
 
-Minimal repro showing that `secure-exec@0.2.0-rc.2` fails in Trigger.dev's esbuild-bundled environment while `0.1.0` works.
+Minimal repro showing that `secure-exec@0.2.0-rc.2` fails when bundled with esbuild (the same way Trigger.dev bundles user code). `0.1.0` works fine.
 
-## Setup
+## Standalone reproduction (no Trigger.dev needed)
+
+```bash
+pnpm install
+node standalone/build-and-run.mjs
+```
+
+This script:
+1. Bundles `standalone/entry.mjs` with esbuild using the same config as Trigger.dev's CLI (`bundle: true, splitting: true, format: "esm", platform: "node", target: ["node20", "es2022"]`)
+2. Runs the bundled output with Node
+
+**With `secure-exec@0.2.0-rc.2`** (current `package.json`):
+
+```
+Build succeeded: 2 output files
+
+Running bundled output...
+
+Error: spawn secure-exec-v8 ENOENT
+```
+
+The `@secure-exec/v8` package tries to spawn its Rust binary but can't locate it in the bundled output — `createRequire(import.meta.url).resolve()` resolves against the chunk directory, not the original package.
+
+**With `secure-exec@0.1.0`**: works correctly, returns `{ code: 0, exports: { answer: 4 } }`.
+
+## Trigger.dev reproduction
 
 ```bash
 cp .env.example .env     # edit TRIGGER_PROJECT_REF if it differs from your project
 pnpm install
 npx trigger login        # authenticate with Trigger.dev
-npx trigger dev          # start dev server
+npx trigger dev           # start dev server
 ```
 
-Then trigger the task with payload:
+Then trigger the `run-js` task with payload:
 ```json
 { "code": "module.exports = { answer: 2 + 2 }" }
 ```
 
-## What works (0.1.0)
+Same result — works with 0.1.0, fails with 0.2.0-rc.2.
 
-With `secure-exec@0.1.0` (current `package.json`), the task runs correctly and returns `{ exitCode: 0, exports: { answer: 4 } }`.
+## What the esbuild plugins do
 
-The two esbuild plugins in `trigger.config.ts` handle the build-time workarounds:
-1. **node-stdlib-browser-stub** — replaces `node-stdlib-browser` with pre-resolved path map (its `require.resolve("./mock/empty.js")` breaks under Trigger's ESM shim)
-2. **inline-secure-exec-bridge** — inlines `@secure-exec/core/dist/bridge.js` at build time (runtime `require.resolve("@secure-exec/core")` fails in bundled output)
+Two esbuild plugins are needed for secure-exec to work in a bundled environment (both versions):
 
-## What breaks (0.2.0-rc.2)
+1. **`node-stdlib-browser-stub`** — `node-stdlib-browser`'s index.js calls `require.resolve("./mock/empty.js")` at module scope. In the bundled output, `require.resolve` is anchored to the chunk path, so this breaks. The plugin intercepts the import at build time, loads the real module (where `require.resolve` works), captures the resolved path map, and inlines it as a static JSON export.
 
-Change `package.json`:
-```diff
--"secure-exec": "0.1.0"
-+"secure-exec": "0.2.0-rc.2"
-```
+2. **`inline-secure-exec-bridge`** — `@secure-exec/node`'s `bridge-loader.js` calls `require.resolve("@secure-exec/core")` at module scope to find `dist/bridge.js`. Same problem — fails in bundled output. The plugin reads `bridge.js` at build time and inlines it as a string literal.
 
-Then `pnpm install && npx trigger dev` and trigger the task. Error:
+These plugins are sufficient for 0.1.0 (which uses `isolated-vm`). For 0.2.0, the new `@secure-exec/v8` package has a third path-resolution issue that these plugins don't cover.
 
-```
-V8 runtime process closed stdout before sending socket path
-```
+## Root cause (0.2.0)
 
-### Root cause
+In 0.2.0, the runtime switched from `isolated-vm` (native Node addon) to `@secure-exec/v8` (Rust binary). The `@secure-exec/v8` runtime:
 
-In 0.2.0, the package structure changed:
-- `@secure-exec/node` → `@secure-exec/nodejs` (bridge-loader path changed)
-- New `@secure-exec/v8` package spawns a Rust binary via `createRequire(import.meta.url).resolve()` to locate platform packages (`@secure-exec/v8-darwin-arm64`, etc.)
+1. Uses `createRequire(import.meta.url).resolve()` to find its platform-specific binary package (`@secure-exec/v8-darwin-arm64`, etc.)
+2. Spawns the binary as a child process
 
-When esbuild bundles `@secure-exec/v8/dist/runtime.js`, the `import.meta.url` points to the output chunk directory, not the original package — so the Rust binary can't be found and the child process fails immediately.
+When esbuild bundles this, `import.meta.url` points to the output chunk — not the original `@secure-exec/v8` package directory. So `require.resolve` can't find the platform package and the binary spawn fails with `ENOENT`.
 
-### Possible fixes
-
-1. Make `@secure-exec/v8` and platform packages external (adding them to `build.external` in trigger.config.ts) — but this alone doesn't resolve it, suggesting there may be additional bundling issues in 0.2.0
-2. The bridge-loader regex needs updating for the new `@secure-exec/nodejs` path
-3. Ideally `@secure-exec/v8` could resolve its binary without `import.meta.url` (e.g. via `__dirname` or a build-time-inlinable path)
+Making `@secure-exec/v8` external doesn't fully resolve the issue either (we tried).
 
 ## Environment
 
 - Node.js: v22.19.0
-- Trigger.dev: 4.4.3
+- esbuild: 0.25.x
 - OS: macOS (Apple Silicon)
