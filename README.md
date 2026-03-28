@@ -16,15 +16,22 @@ failed to bind UDS: path must be shorter than SUN_LEN
 
 **Suggested fix**: Create the socket in `/tmp` (or a short well-known path) regardless of the system temp directory — similar to how PostgreSQL and Docker handle this.
 
-### 2. Missing polyfill source file in published package
+### 2. Missing polyfill source files in published package
 
-When secure-exec runs user code, it internally calls esbuild to bundle polyfills. `@secure-exec/nodejs/dist/polyfills.js` references source files that aren't in the published package:
+When secure-exec runs user code, it internally calls esbuild to bundle Node.js stdlib polyfills for the V8 isolate. `@secure-exec/nodejs/dist/polyfills.js` line 7 resolves custom polyfill sources via:
 
+```js
+new URL(`../src/polyfills/${fileName}`, import.meta.url)
+```
+
+This looks for `@secure-exec/nodejs/src/polyfills/*.js` — but only `dist/` is published (no `src/` directory). The custom polyfill files referenced are: `crypto.js`, `stream-web.js`, `util-types.js`, and several `internal-webstreams-*.js` / `internal-*.js` files.
+
+Error:
 ```
 Could not resolve "/path/to/node_modules/@secure-exec/nodejs/src/polyfills/stream-web.js"
 ```
 
-The `dist/polyfills.js` contains absolute-looking paths to `src/` files, but only `dist/` is published.
+**Fix**: Either include `src/polyfills/` in the published package, or compile those files into `dist/polyfills/` and update the path resolution.
 
 ### 3. Binary path resolution when bundled (esbuild plugin workaround exists)
 
