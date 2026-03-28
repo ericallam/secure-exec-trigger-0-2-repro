@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Local env (see .env.example)
+.env
+.env.*.local
+
+# Trigger.dev dev server / build cache
+.trigger/
+
+# Logs and OS noise
+*.log
+.DS_Store
+
+# TypeScript build output (if added later)
+dist/
