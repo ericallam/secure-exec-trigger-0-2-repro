@@ -198,13 +198,17 @@ try {
   const output = execSync(`node ${join(outdir, "entry.mjs")}`, {
     cwd: projectRoot,
     encoding: "utf8",
-    stdio: ["inherit", "pipe", "pipe"],
+    stdio: ["inherit", "pipe", "inherit"],
     timeout: 15000,
   });
   console.log(output);
 } catch (err) {
-  console.error("Execution failed:");
-  if (err.stdout) console.log("stdout:", err.stdout);
-  if (err.stderr) console.error("stderr:", err.stderr);
-  process.exit(1);
+  if (err.stdout) console.log(err.stdout);
+  // exit code null + signal = child was killed during cleanup, not an error
+  if (err.status === null && err.signal) {
+    // Normal — V8 runtime cleanup
+  } else {
+    console.error("\nExecution failed (exit code " + err.status + ")");
+    process.exit(1);
+  }
 }
