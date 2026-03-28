@@ -1,56 +1,62 @@
 # secure-exec 0.2.0-rc.2 + esbuild bundling reproduction
 
-Minimal repro showing that `secure-exec@0.2.0-rc.2` fails when bundled with esbuild (the same way Trigger.dev bundles user code). `0.1.0` works fine.
+Minimal repro showing issues with `secure-exec@0.2.0-rc.2` in bundled environments (esbuild, same config as Trigger.dev). `0.1.0` works fine.
 
-## Root cause
+## Issues found
 
-There are **two issues** with 0.2.0-rc.2 in bundled environments:
+### 1. Unix domain socket path length (macOS)
 
-### Issue 1: V8 binary path resolution
+The Rust binary (`@secure-exec/v8`) creates a UDS socket in the default temp directory. On macOS the path limit is 104 bytes. Deep working directories (pnpm `.pnpm` store, CI runners, monorepos) push the path over this limit:
 
-`@secure-exec/v8/dist/runtime.js` uses `createRequire(import.meta.url).resolve()` to locate its platform-specific Rust binary. When esbuild bundles this, `import.meta.url` points to the output chunk — not the original package. The binary can't be found and the spawn fails with `ENOENT`.
-
-**Fix**: An esbuild plugin that resolves the binary path at build time and replaces `resolveBinaryPath()` with a static return. See Plugin 2 in `standalone/build-and-run.mjs`.
-
-### Issue 2: Unix domain socket path length (macOS)
-
-Even after fixing binary resolution, the Rust binary panics:
 ```
 failed to bind UDS: path must be shorter than SUN_LEN
 ```
 
-macOS limits Unix domain socket paths to 104 bytes. The `@secure-exec/v8` binary creates its socket in the default temp directory. When the working directory or temp path is long (common with pnpm's `.pnpm` store, CI runners, or deep project paths), the socket path exceeds this limit.
+**Workaround**: `TMPDIR=/tmp`
 
-**Workaround**: Set `TMPDIR=/tmp` before running. This forces the socket to a short path.
+**Suggested fix**: Create the socket in `/tmp` (or a short well-known path) regardless of the system temp directory — similar to how PostgreSQL and Docker handle this.
 
-**Suggested fix for secure-exec**: The Rust binary should create its UDS socket in `/tmp` (or a short well-known path) regardless of the working directory/temp path — similar to how PostgreSQL and Docker handle this.
+### 2. Missing polyfill source file in published package
+
+When secure-exec runs user code, it internally calls esbuild to bundle polyfills. `@secure-exec/nodejs/dist/polyfills.js` references source files that aren't in the published package:
+
+```
+Could not resolve "/path/to/node_modules/@secure-exec/nodejs/src/polyfills/stream-web.js"
+```
+
+The `dist/polyfills.js` contains absolute-looking paths to `src/` files, but only `dist/` is published.
+
+### 3. Binary path resolution when bundled (esbuild plugin workaround exists)
+
+`@secure-exec/v8/dist/runtime.js` uses `createRequire(import.meta.url).resolve()` to locate its platform binary. When esbuild bundles this, `import.meta.url` points to the output chunk, not the original package.
+
+**Workaround**: Make all `@secure-exec/*` packages external so they resolve from `node_modules` at runtime. No esbuild plugins needed — just externals. See the `external` list in `standalone/build-and-run.mjs`.
 
 ## Standalone reproduction (no Trigger.dev needed)
 
 ```bash
 pnpm install
+
+# Without TMPDIR fix — hits UDS path length issue:
 node standalone/build-and-run.mjs
-```
 
-This script:
-1. Bundles `standalone/entry.mjs` with esbuild using the same config as Trigger.dev's CLI
-2. Runs the bundled output with Node
-
-**Expected output with 0.2.0-rc.2:**
-```
-Build succeeded: 2 output files
-Running bundled output...
-Error: spawn secure-exec-v8 ENOENT          # without binary path fix
-# or
-failed to bind UDS: path must be shorter than SUN_LEN  # with binary path fix
-```
-
-**With `TMPDIR=/tmp` workaround** (after binary path fix):
-```
+# With TMPDIR fix — hits missing polyfill source issue:
 TMPDIR=/tmp node standalone/build-and-run.mjs
 ```
 
-**With `secure-exec@0.1.0`**: works without any workarounds.
+**Expected output with `TMPDIR=/tmp`:**
+```
+Build succeeded: 2 output files
+
+Running bundled output...
+
+stdout: SUCCESS: {
+  "code": 1,
+  "errorMessage": "Build failed with 1 error:\nerror: Could not resolve \".../src/polyfills/stream-web.js\""
+}
+```
+
+**With `secure-exec@0.1.0`** (change version in `package.json`): works without any workarounds.
 
 ## Trigger.dev reproduction
 
@@ -66,15 +72,14 @@ Trigger the `run-js` task with:
 { "code": "module.exports = { answer: 2 + 2 }" }
 ```
 
-## esbuild plugins needed
+## Summary
 
-Three esbuild plugins are required for 0.2.0 (two for 0.1.0):
+With all `@secure-exec/*` packages externalized (not bundled), the only changes needed in secure-exec itself are:
 
-1. **`node-stdlib-browser-stub`** — Replaces `node-stdlib-browser` with pre-resolved path map. Its `require.resolve("./mock/empty.js")` breaks under esbuild's ESM shim.
+1. Use a short path (`/tmp`) for the UDS socket regardless of system temp directory
+2. Fix the polyfill bundler to not reference `src/` files that aren't in the published package
 
-2. **`inline-secure-exec-v8-binary`** *(0.2.0 only)* — Resolves the `@secure-exec/v8` platform binary path at build time and inlines it, replacing `resolveBinaryPath()`.
-
-3. **`inline-secure-exec-bridge`** — Inlines `@secure-exec/core/dist/bridge.js` (v0.1) or `@secure-exec/nodejs/dist/bridge.js` (v0.2) at build time. The runtime `require.resolve("@secure-exec/core")` breaks in bundled output.
+No esbuild plugins should be needed for v0.2 if these are fixed — just adding the packages to the `external` list.
 
 ## Environment
 

@@ -51,9 +51,17 @@ try {
     },
     logLevel: "warning",
     external: [
-      // esbuild must not be bundled — it locates its native binary
-      // via a relative path from its JS API entry point.
       "esbuild",
+      "secure-exec",
+      "@secure-exec/core",
+      "@secure-exec/nodejs",
+      "@secure-exec/node",
+      "@secure-exec/v8",
+      "@secure-exec/v8-darwin-arm64",
+      "@secure-exec/v8-darwin-x64",
+      "@secure-exec/v8-linux-x64-gnu",
+      "@secure-exec/v8-linux-arm64-gnu",
+      "node-stdlib-browser",
     ],
     plugins: [
       // Plugin 1: Replace node-stdlib-browser with pre-resolved paths.
