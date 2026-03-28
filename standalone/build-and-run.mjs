@@ -91,7 +91,56 @@ try {
           });
         },
       },
-      // Plugin 2: Inline bridge.js at build time.
+      // Plugin 2: Inline the V8 runtime binary path at build time.
+      // @secure-exec/v8's runtime.js uses createRequire(import.meta.url)
+      // to find its platform binary. When bundled, import.meta.url points
+      // to the chunk — not the package. Fix: resolve the binary at build
+      // time and replace resolveBinaryPath() with a static return.
+      {
+        name: "inline-secure-exec-v8-binary",
+        setup(build) {
+          build.onLoad(
+            { filter: /[\\/]@secure-exec[\\/]v8[\\/]dist[\\/]runtime\.js$/ },
+            (args) => {
+              try {
+                const binaryName =
+                  process.platform === "win32"
+                    ? "secure-exec-v8.exe"
+                    : "secure-exec-v8";
+                const platformKey = `${process.platform}-${process.arch}`;
+                const PLATFORM_PACKAGES = {
+                  "linux-x64": "@secure-exec/v8-linux-x64-gnu",
+                  "linux-arm64": "@secure-exec/v8-linux-arm64-gnu",
+                  "darwin-x64": "@secure-exec/v8-darwin-x64",
+                  "darwin-arm64": "@secure-exec/v8-darwin-arm64",
+                  "win32-x64": "@secure-exec/v8-win32-x64",
+                };
+                const platformPkg = PLATFORM_PACKAGES[platformKey];
+                if (!platformPkg) return undefined;
+
+                const buildRequire = createRequire(args.path);
+                const pkgDir = dirname(
+                  buildRequire.resolve(`${platformPkg}/package.json`)
+                );
+                const resolvedBinary = join(pkgDir, binaryName);
+
+                // Read the original source and replace resolveBinaryPath
+                const source = readFileSync(args.path, "utf8");
+                const patched = source.replace(
+                  /function resolveBinaryPath\(\) \{[\s\S]*?\n\}/,
+                  `function resolveBinaryPath() { return ${JSON.stringify(resolvedBinary)}; }`
+                );
+
+                return { contents: patched, loader: "js" };
+              } catch (err) {
+                console.warn("v8-binary-inline plugin failed:", err.message);
+                return undefined;
+              }
+            }
+          );
+        },
+      },
+      // Plugin 3: Inline bridge.js at build time.
       // (Same as Conner's working setup — matches @secure-exec/node for v0.1
       //  and @secure-exec/nodejs for v0.2)
       {
