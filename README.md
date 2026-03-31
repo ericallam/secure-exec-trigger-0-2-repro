@@ -1,103 +1,98 @@
-# secure-exec 0.2.0-rc.2 + esbuild bundling reproduction
+# secure-exec 0.2.1 + Trigger.dev repro (working setup)
 
-Minimal repro showing issues with `secure-exec@0.2.0-rc.2` in bundled environments (esbuild, same config as Trigger.dev). `0.1.0` works fine. All issues are now worked around with a pnpm patch + `TMPDIR=/tmp`.
+This repo reproduces and works around the current compatibility issues between
+`secure-exec@0.2.1` and Trigger.dev's build/index pipeline.
 
-## Issues found (and fixes)
+## Root cause
 
-### 1. Unix domain socket path length (macOS) — needs fix in Rust binary
+The core issue is path resolution in bundled environments:
 
-The Rust binary (`@secure-exec/v8`) creates a UDS socket in the default temp directory. On macOS the path limit is 104 bytes. Deep working directories (pnpm `.pnpm` store, CI runners, monorepos) push the path over this limit:
+- Trigger bundles task code into chunk files.
+- Some `secure-exec` internals and `node-stdlib-browser` logic resolve sibling
+  files using `import.meta.url` or `require.resolve("./relative")`.
+- In bundled output, those resolutions may anchor to chunk locations instead of
+  package locations, or can embed host-specific absolute paths into output.
 
-```
-failed to bind UDS: path must be shorter than SUN_LEN
-```
+This leads to errors like:
 
-**Our workaround**: `TMPDIR=/tmp`
+- `Cannot find module './mock/empty.js'`
+- `Could not resolve .../node-stdlib-browser/.../proxy/url.js`
+- `Could not resolve .../@secure-exec/nodejs/src/polyfills/stream-web.js`
+- `V8 runtime process closed stdout before sending socket path`
 
-**What maintainers should do**: Create the socket in `/tmp` (or a short well-known path) regardless of the system temp directory — similar to how PostgreSQL and Docker handle this. The Rust code at `src/main.rs:305` should use a short fixed base path.
+## Final working approach in this repo
 
-### 2. Missing polyfill source files in published package — needs packaging fix
+No postinstall patching is required. Everything is handled via
+`trigger.config.ts` custom build extension + runtime safeguards.
 
-`@secure-exec/nodejs/dist/polyfills.js` resolves custom polyfill sources via:
+### 1. Custom build extension plugins
 
-```js
-// line 7
-new URL(`../src/polyfills/${fileName}`, import.meta.url)
-```
+`trigger.config.ts` uses `secureExecCompatibilityExtension()` with 3 plugins:
 
-This looks for `@secure-exec/nodejs/src/polyfills/*.js` — but only `dist/` is published. The `src/` directory is excluded from the package.
+1. `node-stdlib-browser-stub`
+   - Replaces `node-stdlib-browser` import with a runtime-loaded mapping
+   - Avoids baking machine-local absolute paths into the bundle
 
-The 13 polyfill files referenced are: `crypto.js`, `stream-web.js`, `util-types.js`, `webstreams-runtime.js`, `js-transferable.js`, `internal-mime.js`, `internal-test-binding.js`, `internal-worker-js-transferable.js`, and 5 `internal-webstreams-*.js` files.
+2. `inline-secure-exec-bridge`
+   - Inlines `@secure-exec/nodejs` bridge code at build time
+   - Avoids `import.meta.url` bridge lookup failures in chunks
 
-**Our workaround**: pnpm patch that:
-1. Changes the path from `../src/polyfills/` to `./polyfills/`
-2. Copies the polyfill source files from the GitHub repo into `dist/polyfills/`
+3. `fix-secure-exec-polyfills-paths`
+   - Rewrites `resolveCustomPolyfillSource(...)` in
+     `@secure-exec/nodejs/dist/polyfills.js`
+   - Resolves `src/polyfills/*` from package location at runtime
 
-**What maintainers should do**: Either include `src/polyfills/` in the published package (`files` field in package.json), or compile/copy these files into `dist/polyfills/` during the build step and update the path.
+### 2. Deploy-only dependency layer
 
-### 3. Missing `web-streams-polyfill` dependency — needs package.json fix
+`onBuildComplete()` adds a deploy layer:
 
-`@secure-exec/nodejs/dist/polyfills.js` references `web-streams-polyfill/dist/ponyfill.js` in two places:
-- Line 9: hardcoded `WEB_STREAMS_PONYFILL_PATH` (also has a broken relative path `../../../node_modules/.pnpm/node_modules/...` baked in from the dev workspace)
-- `dist/polyfills/webstreams-runtime.js`: `import * as ponyfill from "web-streams-polyfill/dist/ponyfill.js"`
+- `secure-exec: "0.2.1"`
+- `web-streams-polyfill: "^4.2.0"`
 
-But `web-streams-polyfill` is not listed in `dependencies` or `devDependencies` of `@secure-exec/nodejs`.
+This ensures indexing/runtime modules needed by secure-exec are available in the
+deploy image.
 
-**Our workaround**: Added `web-streams-polyfill` as a direct dependency in our project, and patched `polyfills.js` to use `createRequire` with a try/catch instead of the broken hardcoded path.
+### 3. Runtime temp-dir guard
 
-**What maintainers should do**: Add `web-streams-polyfill` to `dependencies` in `@secure-exec/nodejs/package.json`. Also fix the `WEB_STREAMS_PONYFILL_PATH` to not use a hardcoded dev workspace path — use `createRequire(import.meta.url).resolve("web-streams-polyfill/dist/ponyfill.js")` instead.
+`src/run-js.ts` forces:
 
-### 4. Binary path resolution when bundled — externals solve this
+- `TMPDIR=/tmp`
+- `TMP=/tmp`
+- `TEMP=/tmp`
 
-`@secure-exec/v8/dist/runtime.js` uses `createRequire(import.meta.url).resolve()` to locate its platform binary. When esbuild bundles this, `import.meta.url` points to the output chunk, not the original package.
+before creating `NodeRuntime`, to avoid long UDS path failures.
 
-**Our workaround**: Make all `@secure-exec/*` packages external (not bundled). They resolve from `node_modules` at runtime and the binary path works correctly. No esbuild plugins needed.
+## Run it
 
-**What maintainers should do**: This is fine as-is — users just need to externalize the packages. Could document this for bundler users, or consider a fallback that checks `__dirname` relative paths.
-
-## Running the reproduction
-
-### Standalone (no Trigger.dev needed)
-
-```bash
-pnpm install
-TMPDIR=/tmp node standalone/build-and-run.mjs
-```
-
-With the pnpm patch applied (already in this repo), this succeeds:
-```
-Build succeeded: 2 output files
-Running bundled output...
-SUCCESS: { "code": 0, "exports": { "answer": 4 } }
-```
-
-Without `TMPDIR=/tmp`, hits the UDS path length issue on macOS.
-
-### Trigger.dev reproduction
+### Local dev
 
 ```bash
-cp .env.example .env     # edit TRIGGER_PROJECT_REF
+cp .env.example .env
 pnpm install
-npx trigger login
-npx trigger dev
+pnpm exec trigger dev --profile test
 ```
 
-Trigger the `run-js` task with:
+Trigger task payload:
+
 ```json
 { "code": "module.exports = { answer: 2 + 2 }" }
 ```
 
-## Summary for maintainers
+### Deploy
 
-Three things to fix in the published packages:
+```bash
+pnpm exec trigger deploy --profile test --dry-run
+pnpm exec trigger deploy --profile test
+```
 
-1. **`@secure-exec/v8` (Rust binary)**: Use `/tmp` for UDS socket path, not the default temp dir
-2. **`@secure-exec/nodejs` (packaging)**: Include `src/polyfills/` in the published package (or copy to `dist/polyfills/` and fix the path)
-3. **`@secure-exec/nodejs` (package.json)**: Add `web-streams-polyfill` to `dependencies`, and fix the hardcoded `WEB_STREAMS_PONYFILL_PATH` to use runtime resolution instead of a dev workspace path
+## Notes
+
+- `--dry-run` only validates build packaging; full deploy still runs indexing.
+- If you are debugging similar issues, run with `--log-level debug` and inspect
+  the generated `.trigger/tmp/build-*/` artifacts.
 
 ## Environment
 
-- Node.js: v22.19.0
-- esbuild: 0.25.x
-- OS: macOS (Apple Silicon)
-- macOS UDS path limit: 104 bytes
+- Node.js: v22.x
+- Trigger.dev CLI/SDK: 4.4.3
+- secure-exec: 0.2.1

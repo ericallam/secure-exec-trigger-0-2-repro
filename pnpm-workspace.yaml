@@ -3,6 +3,3 @@ minimumReleaseAge: 4320
 minimumReleaseAgeExclude:
   - secure-exec
   - '@secure-exec/*'
-
-patchedDependencies:
-  '@secure-exec/nodejs@0.2.0-rc.2': patches/@secure-exec__nodejs@0.2.0-rc.2.patch

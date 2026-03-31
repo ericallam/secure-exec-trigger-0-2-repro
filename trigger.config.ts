@@ -1,54 +1,60 @@
 import { defineConfig } from "@trigger.dev/sdk";
-import { esbuildPlugin } from "@trigger.dev/build/extensions";
-import path from "node:path";
+import type { BuildExtension } from "@trigger.dev/build";
 import fs from "node:fs";
-import { createRequire } from "node:module";
+import path from "node:path";
 
 export default defineConfig({
   project: "proj_repro",
+  runtime: "node-22",
   dirs: ["./src"],
   maxDuration: 3600,
   build: {
-    extensions: [
-      // Trigger's ESM shim anchors require.resolve() to the chunk path, so
-      // node-stdlib-browser's runtime require.resolve("./mock/empty.js") breaks.
-      // Fix: load the real node-stdlib-browser at build time (where require.resolve
-      // works), capture the resolved path map, and inline it as a static export.
-      esbuildPlugin({
+    extensions: [secureExecCompatibilityExtension()],
+    external: [
+      // esbuild must not be bundled — secure-exec uses it at runtime.
+      "esbuild",
+    ],
+  },
+});
+
+function secureExecCompatibilityExtension(): BuildExtension {
+  return {
+    name: "secure-exec-compatibility",
+    async onBuildStart(context) {
+      context.registerPlugin({
         name: "node-stdlib-browser-stub",
         setup(build) {
-          build.onResolve({ filter: /^node-stdlib-browser$/ }, () => ({
-            path: "node-stdlib-browser",
-            namespace: "nsb-resolved",
-          }));
-          build.onLoad({ filter: /.*/, namespace: "nsb-resolved" }, () => {
-            const buildRequire = createRequire(import.meta.url);
-            const resolved = buildRequire("node-stdlib-browser");
+          build.onResolve({ filter: /^node-stdlib-browser$/ }, function onResolve() {
             return {
-              contents: `export default ${JSON.stringify(resolved)};`,
+              path: "node-stdlib-browser",
+              namespace: "nsb-resolved",
+            };
+          });
+          build.onLoad({ filter: /.*/, namespace: "nsb-resolved" }, function onLoad() {
+            return {
+              contents: [
+                `import { createRequire } from "node:module";`,
+                `const runtimeRequire = createRequire(import.meta.url);`,
+                `const stdLibBrowser = runtimeRequire("node-stdlib-browser");`,
+                `export default stdLibBrowser;`,
+              ].join("\n"),
               loader: "js",
             };
           });
         },
-      }),
-      // @secure-exec/node's bridge-loader.js runs require.resolve("@secure-exec/core")
-      // at module scope to locate dist/bridge.js on disk. This fails in Trigger's
-      // Docker container where the code is bundled into chunks and the package
-      // isn't on disk. Fix: inline bridge.js content at build time so no runtime
-      // filesystem access or package resolution is needed.
-      esbuildPlugin({
+      });
+
+      context.registerPlugin({
         name: "inline-secure-exec-bridge",
         setup(build) {
           build.onLoad(
-            { filter: /[\\/]@secure-exec[\\/]node[\\/]dist[\\/]bridge-loader\.js$/ },
-            (args) => {
-              const buildRequire = createRequire(args.path);
-              const coreEntry = buildRequire.resolve("@secure-exec/core");
-              const coreRoot = path.resolve(path.dirname(coreEntry), "..");
-              const bridgeCode = fs.readFileSync(
-                path.join(coreRoot, "dist", "bridge.js"),
-                "utf8"
-              );
+            {
+              filter:
+                /[\\/]@secure-exec[\\/]node(?:js)?[\\/]dist[\\/]bridge-loader\.js$/,
+            },
+            function onLoad(args) {
+              const bridgePath = path.join(path.dirname(args.path), "bridge.js");
+              const bridgeCode = fs.readFileSync(bridgePath, "utf8");
               return {
                 contents: [
                   `import { getIsolateRuntimeSource } from "@secure-exec/core";`,
@@ -61,13 +67,47 @@ export default defineConfig({
             }
           );
         },
-      }),
-    ],
-    external: [
-      // esbuild must not be bundled — it locates its native binary via a
-      // relative path from its JS API entry point. secure-exec uses esbuild
-      // at runtime to bundle polyfills for sandbox code.
-      "esbuild",
-    ],
-  },
-});
+      });
+
+      context.registerPlugin({
+        name: "fix-secure-exec-polyfills-paths",
+        setup(build) {
+          build.onLoad(
+            { filter: /[\\/]@secure-exec[\\/]nodejs[\\/]dist[\\/]polyfills\.js$/ },
+            function onLoad(args) {
+              const source = fs.readFileSync(args.path, "utf8");
+              const patched = source.replace(
+                /function resolveCustomPolyfillSource\(fileName\) \{[\s\S]*?\n\}/,
+                [
+                  `const secureExecNodejsRequire = createRequire(import.meta.url);`,
+                  `const secureExecNodejsPolyfillsEntry = secureExecNodejsRequire.resolve("@secure-exec/nodejs/internal/polyfills");`,
+                  `const secureExecNodejsRoot = path.resolve(path.dirname(secureExecNodejsPolyfillsEntry), "..");`,
+                  `function resolveCustomPolyfillSource(fileName) {`,
+                  `  return path.join(secureExecNodejsRoot, "src", "polyfills", fileName);`,
+                  `}`,
+                ].join("\n")
+              );
+              return {
+                contents: `import path from "node:path";\n${patched}`,
+                loader: "js",
+              };
+            }
+          );
+        },
+      });
+    },
+    async onBuildComplete(context) {
+      if (context.target !== "deploy") {
+        return;
+      }
+
+      context.addLayer({
+        id: "secure-exec-runtime-deps",
+        dependencies: {
+          "secure-exec": "0.2.1",
+          "web-streams-polyfill": "^4.2.0",
+        },
+      });
+    },
+  };
+}
